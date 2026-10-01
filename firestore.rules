@@ -1,0 +1,197 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ---------- helpers ---------- */
+    function signedIn() { return request.auth != null; }
+    function isSelf(uid) { return signedIn() && request.auth.uid == uid; }
+
+    function clubPath(clubId)         { return /databases/$(database)/documents/clubs/$(clubId); }
+    function memberPath(clubId, uid)  { return /databases/$(database)/documents/clubs/$(clubId)/members/$(uid); }
+    function invitePath(code)         { return /databases/$(database)/documents/invites/$(code); }
+    function bookPath(bookId)         { return /databases/$(database)/documents/books/$(bookId); }
+
+    function isMember(clubId) { return signedIn() && exists(memberPath(clubId, request.auth.uid)); }
+    function isAdmin(clubId) {
+      return isMember(clubId) && get(memberPath(clubId, request.auth.uid)).data.role == 'admin';
+    }
+
+    function validName(n) { return n is string && n.size() >= 1 && n.size() <= 40; }
+    function pageOk(p, bookId) {
+      return p is int && p > 0 && p <= 100000
+        && (get(bookPath(bookId)).data.totalPages == null || p <= get(bookPath(bookId)).data.totalPages);
+    }
+
+    /* ---------- users ---------- */
+    function validProfile(d) {
+      return d.keys().hasOnly(['displayName', 'timezone', 'theme', 'notifications', 'createdAt', 'updatedAt'])
+        && validName(d.displayName)
+        && d.timezone is string && d.timezone.size() <= 64
+        && d.theme in ['system', 'light', 'dark']
+        && d.notifications is map
+        && d.notifications.keys().hasOnly(['reminders', 'partnerReady'])
+        && d.notifications.reminders is bool && d.notifications.partnerReady is bool;
+    }
+
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+      allow create: if isSelf(uid) && validProfile(request.resource.data);
+      allow update: if isSelf(uid) && validProfile(request.resource.data)
+        && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+
+      // Mirror of "clubs I'm in" so the home screen is a single cheap query.
+      match /memberships/{clubId} {
+        allow read: if isSelf(uid);
+        allow create: if isSelf(uid)
+          && existsAfter(memberPath(clubId, uid))
+          && request.resource.data.keys().hasOnly(['clubId', 'bookId', 'joinedAt'])
+          && request.resource.data.clubId == clubId
+          && request.resource.data.joinedAt == request.time;
+        allow update: if false;
+        allow delete: if isSelf(uid);
+      }
+    }
+
+    /* ---------- books ---------- */
+    // Book metadata (title/author/page count) is non-sensitive and ids are unguessable,
+    // so any signed-in user may GET a book they know the id of. Listing is not allowed.
+    function validBook(d) {
+      return d.keys().hasOnly(['title', 'author', 'totalPages', 'coverImage', 'createdBy', 'createdAt', 'active'])
+        && d.title is string && d.title.size() >= 1 && d.title.size() <= 120
+        && d.author is string && d.author.size() <= 120
+        && (d.totalPages == null || (d.totalPages is int && d.totalPages > 0 && d.totalPages <= 20000))
+        && (d.coverImage == null || (d.coverImage is string && d.coverImage.size() <= 500 && d.coverImage.matches('^https://.*')))
+        && d.active is bool;
+    }
+
+    match /books/{bookId} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && validBook(request.resource.data)
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+      allow update: if signedIn() && resource.data.createdBy == request.auth.uid
+        && validBook(request.resource.data)
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if false;
+    }
+
+    /* ---------- clubs ---------- */
+    match /clubs/{clubId} {
+      allow read: if isMember(clubId);
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['name', 'bookId', 'createdBy', 'timezone', 'inviteCode', 'createdAt'])
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() <= 140
+        && request.resource.data.bookId is string
+        && request.resource.data.timezone is string && request.resource.data.timezone.size() <= 64
+        && request.resource.data.inviteCode is string
+        && request.resource.data.createdAt == request.time;
+      // Admin may only change the club timezone / name. Membership is never edited here.
+      allow update: if isAdmin(clubId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'timezone']);
+      allow delete: if false;
+
+      match /members/{userId} {
+        allow read: if isMember(clubId);
+
+        // (a) The creator, in the same batch that creates the club.
+        // (b) Anyone holding a valid, active invite code for THIS club, adding only themselves.
+        allow create: if isSelf(userId)
+          && request.resource.data.keys().hasOnly(['userId', 'displayName', 'role', 'joinedAt', 'inviteCode'])
+          && request.resource.data.userId == userId
+          && validName(request.resource.data.displayName)
+          && request.resource.data.joinedAt == request.time
+          && (
+            (request.resource.data.role == 'admin'
+              && !exists(clubPath(clubId))
+              && getAfter(clubPath(clubId)).data.createdBy == request.auth.uid)
+            ||
+            (request.resource.data.role == 'member'
+              && request.resource.data.inviteCode is string
+              && exists(invitePath(request.resource.data.inviteCode))
+              && get(invitePath(request.resource.data.inviteCode)).data.clubId == clubId
+              && get(invitePath(request.resource.data.inviteCode)).data.active == true)
+          );
+
+        // A member can rename themselves; nothing else (role, joinedAt, userId are immutable).
+        allow update: if isSelf(userId)
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['displayName'])
+          && validName(request.resource.data.displayName);
+
+        // Leave the club yourself, or an admin removes someone.
+        allow delete: if isSelf(userId) || isAdmin(clubId);
+      }
+
+      /* ---------- daily reading entries: one doc per user per day ---------- */
+      // Id is "<yyyy-mm-dd>_<uid>", so there can only ever be ONE entry per user per day.
+      match /entries/{entryId} {
+        function pad(n) { return n < 10 ? '0' + string(n) : string(n); }
+        function utcDateId(t) { return string(t.year()) + '-' + pad(t.month()) + '-' + pad(t.day()); }
+        // The logical date is computed in the club's timezone on the client; rules have no
+        // timezone database, so we accept UTC yesterday/today/tomorrow (covers UTC-12 to UTC+14).
+        function dateNearNow(d) {
+          return d in [
+            utcDateId(request.time - duration.value(1, 'd')),
+            utcDateId(request.time),
+            utcDateId(request.time + duration.value(1, 'd'))
+          ];
+        }
+
+        allow read: if isMember(clubId);
+
+        allow create: if isMember(clubId)
+          && request.resource.data.keys().hasOnly(['userId', 'clubId', 'bookId', 'displayName', 'date', 'pageNumber', 'status', 'submittedAt', 'updatedAt'])
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.clubId == clubId
+          && request.resource.data.bookId == get(clubPath(clubId)).data.bookId
+          && validName(request.resource.data.displayName)
+          && request.resource.data.date is string
+          && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+          && dateNearNow(request.resource.data.date)
+          && entryId == request.resource.data.date + '_' + request.auth.uid
+          && request.resource.data.status == 'OPEN_FOR_DISCUSSION'
+          && request.resource.data.submittedAt == request.time
+          && request.resource.data.updatedAt == request.time
+          && pageOk(request.resource.data.pageNumber, request.resource.data.bookId);
+
+        // Only the owner, only page / note / display name, never identity or date.
+        allow update: if isMember(clubId)
+          && resource.data.userId == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pageNumber', 'discussionNote', 'displayName', 'updatedAt'])
+          && request.resource.data.updatedAt == request.time
+          && validName(request.resource.data.displayName)
+          && pageOk(request.resource.data.pageNumber, resource.data.bookId)
+          && (!('discussionNote' in request.resource.data)
+              || (request.resource.data.discussionNote is string && request.resource.data.discussionNote.size() <= 1000));
+
+        allow delete: if false; // history is never deleted
+      }
+    }
+
+    /* ---------- invites ---------- */
+    match /invites/{code} {
+      // Knowing the code is the credential: get one invite by exact id.
+      allow get: if signedIn();
+      // List only the invitations explicitly addressed to me.
+      allow list: if signedIn() && request.auth.uid in resource.data.invitedUserIds;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(['code', 'clubId', 'bookId', 'clubName', 'bookTitle', 'bookAuthor', 'createdBy', 'createdByName', 'invitedUserIds', 'active', 'createdAt'])
+        && request.resource.data.code == code
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.invitedUserIds is list
+        && request.resource.data.active == true
+        && request.resource.data.createdAt == request.time
+        && getAfter(clubPath(request.resource.data.clubId)).data.createdBy == request.auth.uid;
+      allow update: if isAdmin(resource.data.clubId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['invitedUserIds', 'active']);
+      allow delete: if false;
+    }
+
+    // Everything else is closed.
+    match /{document=**} { allow read, write: if false; }
+  }
+}
